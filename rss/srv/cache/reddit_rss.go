@@ -30,6 +30,11 @@ type RedditRSS struct {
 	cancelCtx context.CancelFunc
 }
 
+type redditPostRec struct {
+	Added time.Time
+	Post  *reddit.Post
+}
+
 // NewRedditRSSCache creates new RedditRss cache instance
 func NewRedditRSSCache(
 	ctx context.Context, client *reddit.Client, db *bolt.DB, user string,
@@ -90,7 +95,7 @@ func (c *RedditRSS) update() error {
 			if id == nil {
 				return fmt.Errorf("failed to get post id %v", post)
 			}
-			value, err := json.Marshal(post)
+			value, err := json.Marshal(redditPostRec{Added: time.Now(), Post: post})
 			redditID := []byte(*id)
 			if err != nil {
 				return fmt.Errorf("failed to marshal post %s: %s", redditID, err)
@@ -160,28 +165,42 @@ func (c *RedditRSS) GetFeed() *feeds.Feed {
 	return c.feed
 }
 
+func (c *RedditRSS) setFeed(feed *feeds.Feed) {
+	c.rwlock.Lock()
+	defer c.rwlock.Unlock()
+	c.feed = feed
+}
+
 func (c *RedditRSS) buildPostsFeed() error {
+	now := time.Now()
 	feed := &feeds.Feed{
 		Title: fmt.Sprintf("%s's reddit saved posts", c.user),
 		Link: &feeds.Link{
 			Href: fmt.Sprintf("https://www.reddit.com/user/%s/saved/", c.user),
 		},
+		Created: now,
 	}
 	err := c.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(postsContentBucket))
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
-			post := &reddit.Post{}
+			post := &redditPostRec{}
 			err := json.Unmarshal(v, post)
 			if err != nil {
 				return fmt.Errorf("failed to unmarshal post %s: %s", k, err)
 			}
-			title := getPostTitle(post)
-			link := getPostLink(post)
+			title := getRedditPostTitle(post.Post)
+			link := getRedditPostLink(post.Post)
+			postCreated := now
+			if !post.Added.IsZero() {
+				postCreated = post.Added
+			}
+
 			// log.Infof("post title %s", title)
 			feed.Add(&feeds.Item{
-				Title: title,
-				Link:  &feeds.Link{Href: link},
+				Title:   title,
+				Link:    &feeds.Link{Href: link},
+				Created: postCreated,
 			})
 		}
 		return nil
@@ -189,9 +208,7 @@ func (c *RedditRSS) buildPostsFeed() error {
 	if err != nil {
 		return err
 	}
-	c.rwlock.Lock()
-	defer c.rwlock.Unlock()
-	c.feed = feed
+	c.setFeed(feed)
 	return nil
 }
 
@@ -218,26 +235,34 @@ func getID(p *reddit.Post) *string {
 	return getStringField(p.Data, "id")
 }
 
-func getPostTitle(p *reddit.Post) string {
-	if p.Kind == reddit.PostKind {
-		title := getStringField(p.Data, "title")
-		if title != nil {
-			return *title
+func getRedditPostTitle(p *reddit.Post) string {
+	subreddit := getStringField(p.Data, "subreddit_name_prefixed")
+	head := ""
+	if subreddit != nil {
+		head = fmt.Sprintf("[%s] ", *subreddit)
+	}
+	getTitle := func() string {
+		if p.Kind == reddit.PostKind {
+			title := getStringField(p.Data, "title")
+			if title != nil {
+				return *title
+			}
+			return fmt.Sprintf("%sReddit post", head)
 		}
+		if p.Kind == reddit.CommentKind {
+			title := getStringField(p.Data, "link_title")
+			if title != nil {
+				return *title
+			}
+			return "comment"
+		}
+		log.Errorf("unexpected reddit post kind: %s", p.Kind)
 		return "Reddit post"
 	}
-	if p.Kind == reddit.CommentKind {
-		title := getStringField(p.Data, "link_title")
-		if title != nil {
-			return *title
-		}
-		return "comment"
-	}
-	log.Errorf("unexpected reddit post kind: %s", p.Kind)
-	return "Reddit post"
+	return fmt.Sprintf("%s%s", head, getTitle())
 }
 
-func getPostLink(p *reddit.Post) string {
+func getRedditPostLink(p *reddit.Post) string {
 	if p.Kind == reddit.PostKind {
 		link := getStringField(p.Data, "permalink")
 		if link != nil {
